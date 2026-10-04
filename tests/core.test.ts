@@ -44,5 +44,6 @@ test("restore validates persistent state and cluster/project identity", () => {
   assert(isJob(job));
   assert(!isJob({ ...job, id: "other" }));
   assert(!isJob({ ...job, lastState: "garbage" }));
+  assert(!isJob({ ...job, name: "--all", id: identity("cluster", "project", "--all") }));
   assert(!isJob(null));
 });

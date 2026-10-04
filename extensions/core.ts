@@ -95,6 +95,10 @@ export function submitArgs(params: Submit, name: string, project: string): strin
 export function isJob(value: unknown): value is Job {
   if (!value || typeof value !== "object") return false;
   const j = value as Job;
+  try {
+    identifier(j.name, "job name");
+    identifier(j.project, "project");
+  } catch { return false; }
   return [j.id, j.name, j.project, j.cluster, j.submittedAt].every(v => typeof v === "string" && !!v)
     && typeof j.interactive === "boolean"
     && ["PENDING", "RUNNING", "SUSPENDED", "COMPLETED", "FAILED", "CANCELLED", "UNKNOWN"].includes(j.lastState)
