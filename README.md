@@ -4,7 +4,7 @@ Session-persistent **Run:ai CLI v1** submission and monitoring for [Pi](https://
 
 ## Install
 
-Requires a recent Pi with `agent_before_settle`/`agent_settled`, and an installed, configured, authenticated Run:ai CLI exposing `submit`, `list jobs`, `logs`, and `delete job`. Tested with Run:ai 2.24.86 (v1 command surface). CLI v2 is **not** supported yet.
+Requires a recent Pi with extension steering notifications, and an installed, configured, authenticated Run:ai CLI exposing `submit`, `list jobs`, `logs`, and `delete job`. Tested with Run:ai 2.24.86 (v1 command surface). CLI v2 is **not** supported yet.
 
 ```sh
 pi install git:github.com/jrhuebers/pi-runai
@@ -49,7 +49,7 @@ Example `runai_submit` arguments (replace placeholders using your site's image, 
 
 ## Monitoring
 
-The extension polls asynchronously every 15 seconds, once per tracked project in the current cluster, with no overlapping monitor polls. Start, state-change, completion and optional running-time reminder messages enter Pi's context. Active-turn notifications are batched at `agent_before_settle`, not injected into the editor's steering queue.
+The extension polls asynchronously every 5 seconds, once per tracked project in the current cluster, with no overlapping monitor polls. Start, state-change, completion and optional running-time reminder messages enter Pi's context. Notifications are queued immediately with `deliverAs: "steer"` and `triggerTurn: true`, matching pi-slurm: an active run receives them at its next eligible model continuation, while an idle session starts a continuation. They are not buffered until `agent_before_settle` or flushed from `agent_settled`. Polling and CLI latency still apply, and notifications do not interrupt an executing tool; use pi-sleep's `runai_job_ids` to wake a watched sleep.
 
 Job metadata is saved in the current Pi session branch. Reload, session restore and tree navigation rebuild that branch's tracking state. Monitoring stops on shutdown; it only runs while Pi is running. Terminal states are retained for inspection. Completed jobs are **not** automatically deleted.
 
@@ -63,11 +63,11 @@ The v1 CLI has no structured `list jobs` output. This extension parses only the 
 |---|---|
 | `PI_RUNAI_PROJECT` | CLI default project; explicit tool argument takes precedence |
 | `PI_RUNAI_CLI` | `runai` on PATH (or path to an approved CLI wrapper) |
-| `PI_RUNAI_POLL_INTERVAL_MS` | `15000`, minimum `5000` |
+| `PI_RUNAI_POLL_INTERVAL_MS` | `5000`, minimum `5000` |
 
 ### Event integration
 
-Emits `runai:finished` with `{ id, name, project, cluster, status }` for completed, failed or cancelled tracked jobs. Restoring a terminal job re-emits this event for newly loaded listeners. This is a separate event from `slurm:finished`; sleep extensions must explicitly support it. No automatic `pi-sleep` integration is claimed.
+Emits `runai:finished` with `{ id, name, project, cluster, status }` for completed, failed or cancelled tracked jobs. Restoring a terminal job re-emits this event for newly loaded listeners. This is a separate event from `slurm:finished`; sleep extensions must explicitly support it. With a [pi-sleep](https://github.com/jrhuebers/pi-sleep) revision that exposes `runai_job_ids`, pass the full tracked IDs to `sleep({ seconds: 3600, message: "Inspect the job logs.", runai_job_ids: ["cluster/project/name"] })` to interrupt a wait on any listed terminal job. Older pi-sleep revisions supporting only background tasks and Slurm must be updated. Detection follows this extension's polling cadence; preemption, unknown states and missing jobs never imply completion.
 
 ## RCP documentation consulted
 

@@ -8,16 +8,22 @@ function harness() {
   const tools = new Map<string, any>();
   const entries: any[] = [];
   const messages: any[] = [];
+  const deliveryOptions: any[] = [];
   const events: any[] = [];
   const commands: string[][] = [];
   let cluster = "cluster-a";
   let rows = new Map<string, string>();
   let error = false;
+  let settling = false;
   const pi = {
     on(name: string, handler: Function) { handlers.set(name, handler); },
     registerTool(tool: any) { tools.set(tool.name, tool); },
     appendEntry(customType: string, data: unknown) { entries.push({ type: "custom", customType, data: structuredClone(data) }); },
-    sendMessage(message: unknown) { messages.push(message); },
+    sendMessage(message: unknown, options: any) {
+      if (settling && options?.triggerTurn) throw new Error("Agent is already processing a prompt");
+      messages.push(message);
+      deliveryOptions.push(options);
+    },
     events: { emit(name: string, data: unknown) { events.push({ name, data }); } },
     async exec(_cli: string, args: string[]) {
       commands.push(args);
@@ -32,14 +38,45 @@ function harness() {
   };
   extension(pi as unknown as ExtensionAPI);
   const ctx = { hasUI: false, sessionManager: { getBranch: () => entries } };
-  return { handlers, tools, entries, messages, events, commands, ctx, rows,
+  return { handlers, tools, entries, messages, deliveryOptions, events, commands, ctx, rows,
     setCluster: (value: string) => { cluster = value; }, setError: (value: boolean) => { error = value; },
+    setSettling: (value: boolean) => { settling = value; },
     call: (name: string, params: any) => tools.get(name).execute("id", params, undefined, undefined, ctx),
     async start() { await handlers.get("session_start")?.({}, ctx); },
     stop() { handlers.get("session_shutdown")?.({}, ctx); },
   };
 }
 async function settled() { for (let i = 0; i < 20; i++) await new Promise<void>(resolve => setImmediate(resolve)); }
+function pollInterval() {
+  const raw = Number(process.env.PI_RUNAI_POLL_INTERVAL_MS ?? 5000);
+  return Number.isFinite(raw) ? Math.max(5000, raw) : 5000;
+}
+
+for (const [configured, expected] of [[undefined, 5000], ["invalid", 5000], ["1000", 5000], ["10000", 10000]] as const) {
+  test(`poll interval ${configured ?? "default"} resolves to ${expected}ms`, async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    const previous = process.env.PI_RUNAI_POLL_INTERVAL_MS;
+    if (configured === undefined) delete process.env.PI_RUNAI_POLL_INTERVAL_MS;
+    else process.env.PI_RUNAI_POLL_INTERVAL_MS = configured;
+    const h = harness();
+    try {
+      await h.start();
+      await h.call("runai_submit", { name: "job", image: "ubuntu" });
+      h.rows.set("job", "Succeeded");
+      t.mock.timers.tick(expected - 1);
+      await settled();
+      assert.equal(h.events.length, 0);
+      t.mock.timers.tick(1);
+      await settled();
+      assert.equal(h.events.length, 1);
+      assert.equal(h.messages.length, 1);
+    } finally {
+      h.stop();
+      if (previous === undefined) delete process.env.PI_RUNAI_POLL_INTERVAL_MS;
+      else process.env.PI_RUNAI_POLL_INTERVAL_MS = previous;
+    }
+  });
+}
 
 test("submit, tracking, bounded logs, duplicate protection and explicit cancellation", async () => {
   const h = harness();
@@ -58,24 +95,93 @@ test("submit, tracking, bounded logs, duplicate protection and explicit cancella
     await h.call("runai_cancel", { job_id: "cluster-a/lab-user/job", reason: "obsolete", confirm: true });
     assert.equal(h.entries.at(-1).data.jobs[0].lastState, "CANCELLED");
     assert.equal(h.events.at(-1).name, "runai:finished");
+    assert.deepEqual(h.deliveryOptions.at(-1), { triggerTurn: true, deliverAs: "steer" });
     assert(!h.commands.some(args => args.includes("--all")));
   } finally { h.stop(); }
 });
-test("monitor transitions persist and inject notifications only at agent boundaries", async () => {
+test("running notifications are steered immediately, not flushed during settlement", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const h = harness();
+  try {
+    await h.start();
+    await h.call("runai_submit", { name: "job", image: "ubuntu" });
+    h.handlers.get("agent_start")?.();
+    h.rows.set("job", "Running");
+    t.mock.timers.tick(pollInterval());
+    await settled();
+    assert.equal(h.messages.length, 1);
+    assert.equal(h.messages[0].details.status, "RUNNING");
+    assert.deepEqual(h.deliveryOptions[0], { triggerTurn: true, deliverAs: "steer" });
+    assert.equal(h.events.length, 0);
+    assert.equal(h.entries.at(-1).data.jobs[0].lastState, "RUNNING");
+    h.setSettling(true);
+    assert.equal(h.handlers.get("agent_before_settle")?.(), undefined);
+    h.handlers.get("agent_settled")?.();
+    assert.equal(h.messages.length, 1);
+    assert(!h.handlers.has("agent_before_settle"));
+    assert(!h.handlers.has("agent_settled"));
+  } finally { h.stop(); }
+});
+for (const [raw, status] of [["Succeeded", "COMPLETED"], ["Failed", "FAILED"], ["Cancelled", "CANCELLED"]]) {
+  test(`${status} immediately steers one notification and emits one sleep event during an active run`, async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    const h = harness();
+    try {
+      await h.start();
+      await h.call("runai_submit", { name: "job", image: "ubuntu" });
+      h.handlers.get("agent_start")?.();
+      h.rows.set("job", raw);
+      t.mock.timers.tick(pollInterval());
+      await settled();
+      assert.equal(h.messages.length, 1); // No settlement or final assistant response required.
+      assert.equal(h.messages[0].details.status, status);
+      assert.equal(h.messages[0].display, true);
+      assert.deepEqual(h.deliveryOptions[0], { triggerTurn: true, deliverAs: "steer" });
+      assert.equal(h.events.length, 1);
+      assert.equal(h.events[0].name, "runai:finished");
+      assert.equal(h.events[0].data.status, status);
+      assert.equal(h.entries.at(-1).data.jobs[0].lastState, status);
+      t.mock.timers.tick(pollInterval());
+      await settled();
+      h.handlers.get("agent_before_settle")?.();
+      h.handlers.get("agent_settled")?.();
+      assert.equal(h.messages.length, 1);
+      assert.equal(h.events.length, 1);
+    } finally { h.stop(); }
+  });
+}
+test("idle completion still requests a continuation, and restore only replays the sleep event", async () => {
   const h = harness();
   try {
     await h.call("runai_submit", { name: "job", image: "ubuntu" });
-    h.handlers.get("agent_start")!();
     h.rows.set("job", "Succeeded");
     await h.start();
     await settled();
-    assert.equal(h.entries.at(-1).data.jobs[0].lastState, "COMPLETED");
-    assert.equal(h.messages.length, 0);
-    const draft = h.handlers.get("agent_before_settle")!();
-    assert.equal(draft.continue, true);
-    assert.equal(draft.entries[0].details.status, "COMPLETED");
-    assert.equal(h.handlers.get("agent_before_settle")!(), undefined);
+    assert.equal(h.messages.length, 1);
+    assert.deepEqual(h.deliveryOptions[0], { triggerTurn: true, deliverAs: "steer" });
     assert.equal(h.events.length, 1);
+    await h.start();
+    await settled();
+    assert.equal(h.messages.length, 1);
+    assert.equal(h.events.length, 2);
+  } finally { h.stop(); }
+});
+test("running-time reminder is steered once without waiting for settlement", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const h = harness();
+  try {
+    await h.call("runai_submit", { name: "job", image: "ubuntu", notify_after_minutes: 1 });
+    Object.assign(h.entries.at(-1).data.jobs[0], { lastState: "RUNNING", startedAt: new Date(Date.now() - 120000).toISOString() });
+    h.rows.set("job", "Running");
+    h.handlers.get("agent_start")?.();
+    await h.start();
+    await settled();
+    assert.equal(h.messages.length, 1);
+    assert.match(h.messages[0].content, /running-time reminder/);
+    assert.deepEqual(h.deliveryOptions[0], { triggerTurn: true, deliverAs: "steer" });
+    t.mock.timers.tick(pollInterval());
+    await settled();
+    assert.equal(h.messages.length, 1);
   } finally { h.stop(); }
 });
 test("missing jobs, unknown status, preemption and auth errors do not signal completion", async () => {

@@ -16,10 +16,8 @@ export default function runai(pi: ExtensionAPI): void {
   let controller = new AbortController();
   let generation = 0;
   let polling = false;
-  let active = false;
-  let pending: { content: string; details: { jobId: string; status: State } }[] = [];
-  const rawInterval = Number(process.env.PI_RUNAI_POLL_INTERVAL_MS ?? 15000);
-  const interval = Number.isFinite(rawInterval) ? Math.max(5000, rawInterval) : 15000;
+  const rawInterval = Number(process.env.PI_RUNAI_POLL_INTERVAL_MS ?? 5000);
+  const interval = Number.isFinite(rawInterval) ? Math.max(5000, rawInterval) : 5000;
   const cli = process.env.PI_RUNAI_CLI || "runai";
 
   async function run(args: string[], signal?: AbortSignal, timeout = 15000): Promise<string> {
@@ -44,8 +42,10 @@ export default function runai(pi: ExtensionAPI): void {
   function persist() { pi.appendEntry(ENTRY, { version: 1, jobs: [...jobs.values()] }); }
   function notify(job: Job, text: string) {
     const message = { content: `[RUNAI] ${job.id} ${text}`, details: { jobId: job.id, status: job.lastState } };
-    if (active) pending.push(message);
-    else pi.sendMessage({ customType: MESSAGE, ...message, display: true }, { triggerTurn: true });
+    // Queue into the active run immediately, rather than waiting for the whole
+    // run to settle. Pi delivers steering at its next eligible boundary and
+    // starts a continuation when idle, just as pi-slurm does.
+    pi.sendMessage({ customType: MESSAGE, ...message, display: true }, { triggerTurn: true, deliverAs: "steer" });
   }
   function emitFinished(job: Job) {
     pi.events.emit("runai:finished", { id: job.id, name: job.name, project: job.project, cluster: job.cluster, status: job.lastState });
@@ -102,7 +102,6 @@ export default function runai(pi: ExtensionAPI): void {
     controller.abort();
     controller = new AbortController();
     polling = false;
-    pending = [];
   }
   function restore(ctx: ExtensionContext) {
     stop();
@@ -131,20 +130,7 @@ export default function runai(pi: ExtensionAPI): void {
 
   pi.on("session_start", (_event, ctx) => restore(ctx));
   pi.on("session_tree", (_event, ctx) => restore(ctx));
-  pi.on("session_shutdown", () => { stop(); active = false; });
-  pi.on("agent_start", () => { active = true; });
-  pi.on("agent_before_settle", () => {
-    if (!pending.length) return;
-    const messages = pending;
-    pending = [];
-    return { entries: messages.map(message => ({ type: "custom_message" as const, customType: MESSAGE, ...message, display: true })), continue: true };
-  });
-  pi.on("agent_settled", () => {
-    active = false;
-    const messages = pending;
-    pending = [];
-    for (const message of messages) pi.sendMessage({ customType: MESSAGE, ...message, display: true }, { triggerTurn: true });
-  });
+  pi.on("session_shutdown", () => stop());
 
   pi.registerTool({
     name: "runai_submit", label: "Submit Run:ai Job",
