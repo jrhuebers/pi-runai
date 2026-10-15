@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import extension from "../extensions/index.js";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, statSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 function harness() {
@@ -15,6 +19,12 @@ function harness() {
   let rows = new Map<string, string>();
   let error = false;
   let settling = false;
+  let logOutput = "example log";
+  let captureError = false;
+  let logReadError = false;
+  let captureGate: Promise<void> | undefined;
+  const root = mkdtempSync(join(tmpdir(), "runai-extension-"));
+  const captures: string[] = [];
   const pi = {
     on(name: string, handler: Function) { handlers.set(name, handler); },
     registerTool(tool: any) { tools.set(tool.name, tool); },
@@ -32,18 +42,37 @@ function harness() {
       else if (args[0] === "list") output = "NAME STATUS AGE\n" + [...rows].map(([name, status]) => `${name} ${status} 1m`).join("\n");
       else if (args[0] === "submit") { rows.set(args[args.indexOf("--name") + 1], "Pending"); output = "Submitted successfully"; }
       else if (args[0] === "delete") rows.delete(args[2]);
-      else if (args[0] === "logs") output = "example log";
-      return { stdout: output, stderr: error ? "Unauthorized" : "", code: error ? 1 : 0, killed: false };
+      else if (args[0] === "logs") output = logOutput;
+      return { stdout: output, stderr: error ? "Unauthorized" : logReadError && args[0] === "logs" ? "Pod no longer exists" : "", code: error || (logReadError && args[0] === "logs") ? 1 : 0, killed: false };
     },
   };
-  extension(pi as unknown as ExtensionAPI);
-  const ctx = { hasUI: false, sessionManager: { getBranch: () => entries } };
-  return { handlers, tools, entries, messages, deliveryOptions, events, commands, ctx, rows,
+  extension(pi as unknown as ExtensionAPI, { capture: {
+    create: (cwd, name) => {
+      const directory = join(cwd, "runai-logs");
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
+      const file = join(directory, `${name}-${randomBytes(8).toString("hex")}.out`);
+      writeFileSync(file, "", { mode: 0o600, flag: "wx" });
+      return file;
+    },
+    follow: async (job) => { captures.push(`follow:${job.id}`); },
+    finish: async (job) => {
+      captures.push(`finish:${job.id}`);
+      if (captureError) throw new Error("synthetic capture failure");
+      if (captureGate) await captureGate;
+      appendFileSync(job.logPath!, logOutput);
+    },
+    stopAll() {}, stopJob() {},
+  } });
+  const ctx = { cwd: root, hasUI: false, sessionManager: { getBranch: () => entries } };
+  return { handlers, tools, entries, messages, deliveryOptions, events, commands, ctx, rows, captures,
+    setLogOutput: (value: string) => { logOutput = value; }, setCaptureError: (value: boolean) => { captureError = value; },
+    setLogReadError: (value: boolean) => { logReadError = value; },
+    setCaptureGate: (value: Promise<void>) => { captureGate = value; },
     setCluster: (value: string) => { cluster = value; }, setError: (value: boolean) => { error = value; },
     setSettling: (value: boolean) => { settling = value; },
     call: (name: string, params: any) => tools.get(name).execute("id", params, undefined, undefined, ctx),
     async start() { await handlers.get("session_start")?.({}, ctx); },
-    stop() { handlers.get("session_shutdown")?.({}, ctx); },
+    stop() { handlers.get("session_shutdown")?.({}, ctx); rmSync(root, { recursive: true, force: true }); },
   };
 }
 async function settled() { for (let i = 0; i < 20; i++) await new Promise<void>(resolve => setImmediate(resolve)); }
@@ -212,6 +241,119 @@ test("context switch refuses logs/deletion and does not observe identically name
     assert(!h.commands.some(args => args[0] === "delete"));
   } finally { h.stop(); }
 });
+test("large log reads preserve newest failures and save the complete requested output privately", async () => {
+  const h = harness();
+  try {
+    await h.call("runai_submit", { name: "job", image: "ubuntu" });
+    const raw = "  " + "😀".repeat(12000) + "\nLATEST_ERROR_MARKER\n";
+    h.setLogOutput(raw);
+    const result = await h.call("runai_logs", { job_id: "cluster-a/lab-user/job", tail: 2000, pod: "job-pod" });
+    assert(result.content[0].text.includes("LATEST_ERROR_MARKER"));
+    assert.equal(result.details.truncated, true);
+    assert.equal(readFileSync(result.details.fullOutputPath, "utf8"), raw);
+    assert.equal(statSync(result.details.fullOutputPath).mode & 0o777, 0o600);
+    assert(h.commands.at(-1)!.includes("--pod"));
+  } finally { h.stop(); }
+});
+test("captured logs and their paths survive job deletion, and local reads work across contexts", async () => {
+  const h = harness();
+  try {
+    const submitted = await h.call("runai_submit", { name: "job", image: "ubuntu" });
+    const logPath = h.entries.at(-1).data.jobs[0].logPath;
+    assert(submitted.content[0].text.includes(logPath));
+    await h.call("runai_cancel", { job_id: "cluster-a/lab-user/job", reason: "mock-only", confirm: true });
+    assert.equal(readFileSync(logPath, "utf8"), "example log");
+    assert(h.events.at(-1).data.logPath === logPath);
+    assert(h.messages.at(-1).content.includes(logPath));
+    const count = h.commands.length;
+    h.setCluster("other-cluster");
+    const result = await h.call("runai_logs", { job_id: "cluster-a/lab-user/job", local: true });
+    assert.equal(h.commands.length, count);
+    assert.equal(result.details.local, true);
+    assert(result.content[0].text.includes("example log"));
+  } finally { h.stop(); }
+});
+test("unavailable pod logs fall back to the retained file instead of losing captured output", async () => {
+  const h = harness();
+  try {
+    await h.call("runai_submit", { name: "job", image: "ubuntu" });
+    appendFileSync(h.entries.at(-1).data.jobs[0].logPath, "retained evidence\n");
+    h.setLogReadError(true);
+    const result = await h.call("runai_logs", { job_id: "cluster-a/lab-user/job" });
+    assert.equal(result.details.local, true);
+    assert.match(result.content[0].text, /retained evidence/);
+    assert.match(result.content[0].text, /may be incomplete/);
+  } finally { h.stop(); }
+});
+test("running log capture starts automatically and short completed jobs get a final snapshot", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const h = harness();
+  try {
+    await h.start();
+    await h.call("runai_submit", { name: "job", image: "ubuntu" });
+    h.rows.set("job", "Running");
+    t.mock.timers.tick(pollInterval());
+    await settled();
+    assert(h.captures.includes("follow:cluster-a/lab-user/job"));
+    h.rows.set("job", "Succeeded");
+    t.mock.timers.tick(pollInterval());
+    await settled();
+    assert(h.captures.includes("finish:cluster-a/lab-user/job"));
+    assert.equal(h.entries.at(-1).data.jobs[0].logCaptureStatus, "saved");
+    assert.equal(h.events.length, 1);
+  } finally { h.stop(); }
+});
+test("failed final capture blocks destructive deletion unless log loss was explicitly approved", async () => {
+  const h = harness();
+  try {
+    h.rows.set("job", "Running");
+    await h.call("runai_track", { name: "job" });
+    h.setCaptureError(true);
+    await assert.rejects(h.call("runai_cancel", { job_id: "cluster-a/lab-user/job", reason: "mock-only", confirm: true }), /NOT deleted/);
+    assert(!h.commands.some(args => args[0] === "delete"));
+    assert.equal(h.entries.at(-1).data.jobs[0].logCaptureStatus, "error");
+    await h.call("runai_cancel", { job_id: "cluster-a/lab-user/job", reason: "approved mock-only log loss", confirm: true, allow_log_loss: true });
+    assert(h.commands.some(args => args[0] === "delete"));
+  } finally { h.stop(); }
+});
+test("completion notification and sleep event do not wait for slow disk capture", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const h = harness();
+  let release!: () => void;
+  h.setCaptureGate(new Promise<void>(resolve => { release = resolve; }));
+  try {
+    await h.start();
+    await h.call("runai_submit", { name: "job", image: "ubuntu" });
+    h.rows.set("job", "Succeeded");
+    t.mock.timers.tick(pollInterval());
+    await settled();
+    assert.equal(h.events.length, 1);
+    assert.equal(h.messages.length, 1);
+    assert.equal(h.entries.at(-1).data.jobs[0].logCaptureStatus, "saving");
+    release();
+    await settled();
+    assert.equal(h.entries.at(-1).data.jobs[0].logCaptureStatus, "saved");
+    assert.equal(h.messages.length, 1);
+  } finally { release(); await settled(); h.stop(); }
+});
+
+test("legacy restored terminal jobs get a log path and snapshot without duplicate completion messages", async () => {
+  const h = harness();
+  try {
+    await h.call("runai_submit", { name: "job", image: "ubuntu" });
+    const legacy = h.entries.at(-1).data.jobs[0];
+    delete legacy.logPath;
+    legacy.lastState = "COMPLETED";
+    await h.start();
+    await settled();
+    const restored = h.entries.at(-1).data.jobs[0];
+    assert(restored.logPath);
+    assert.equal(restored.logCaptureStatus, "saved");
+    assert.equal(h.messages.length, 0);
+    assert.equal(h.events.length, 1);
+  } finally { h.stop(); }
+});
+
 test("restore only uses current branch and validates stored state", async () => {
   const h = harness();
   try {

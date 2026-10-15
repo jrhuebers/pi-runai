@@ -1,2 +1,4 @@
 node_modules/
 *.tgz
+# Application logs can contain private data.
+runai-logs/

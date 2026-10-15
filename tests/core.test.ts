@@ -46,4 +46,8 @@ test("restore validates persistent state and cluster/project identity", () => {
   assert(!isJob({ ...job, lastState: "garbage" }));
   assert(!isJob({ ...job, name: "--all", id: identity("cluster", "project", "--all") }));
   assert(!isJob(null));
+  assert(isJob({ ...job, logPath: "/tmp/runai-logs/job-0123456789abcdef.out" }));
+  for (const logPath of [123, "relative.out", "/tmp/unrelated.out", "/tmp/job-0123456789abcdefXout"]) {
+    assert(!isJob({ ...job, logPath }));
+  }
 });

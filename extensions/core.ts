@@ -3,6 +3,7 @@ export type Job = {
   id: string; name: string; project: string; cluster: string; interactive: boolean;
   submittedAt: string; lastState: State; startedAt?: string;
   notifyAfterMinutes?: number; reminderSent?: boolean; completionNotified?: boolean;
+  logPath?: string; logCaptureStatus?: "following" | "saving" | "saved" | "error"; logCaptureError?: string;
 };
 export function terminal(state: State): boolean {
   return ["COMPLETED", "FAILED", "CANCELLED"].includes(state);
@@ -102,5 +103,7 @@ export function isJob(value: unknown): value is Job {
   return [j.id, j.name, j.project, j.cluster, j.submittedAt].every(v => typeof v === "string" && !!v)
     && typeof j.interactive === "boolean"
     && ["PENDING", "RUNNING", "SUSPENDED", "COMPLETED", "FAILED", "CANCELLED", "UNKNOWN"].includes(j.lastState)
-    && j.id === identity(j.cluster, j.project, j.name);
+    && j.id === identity(j.cluster, j.project, j.name)
+    && (j.logPath === undefined || (typeof j.logPath === "string" && j.logPath.startsWith("/") && !j.logPath.includes("\0")
+      && new RegExp(`^${j.name}-[a-f0-9]{16}\\.out$`).test(j.logPath.split("/").at(-1)!)));
 }
